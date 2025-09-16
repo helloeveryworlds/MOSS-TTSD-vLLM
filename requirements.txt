@@ -16,4 +16,7 @@ einops
 huggingface_hub
 liger_kernel
 pydub
+fastapi
+uvicorn
+vllm
 # flash-attn    # Need to install separately
