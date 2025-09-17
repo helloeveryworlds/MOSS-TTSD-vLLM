@@ -52,6 +52,7 @@ MOSS-TTSD（text to spoken dialogue）是一个开源的中英双语口语对话
 conda create -n moss_ttsd python=3.10 -y && conda activate moss_ttsd
 pip install -r requirements.txt
 pip install flash-attn
+# 可选：如需运行 vLLM 推理服务，请单独安装 vLLM（不同 CUDA 版本对应不同安装包，详见 https://docs.vllm.ai/en/latest/getting_started/installation.html）。
 ```
 
 ### 下载 XY-Tokenizer 权重
@@ -494,6 +495,55 @@ python finetune/finetune_workflow.py --config path/to/your/config.yaml
 #### 参数说明
 
 - `-c`, `--config`: 工作流配置 YAML 文件的路径（默认：`./finetune/finetune_config.yaml`）
+
+## 使用 vLLM 加速推理
+
+我们提供了一个基于 FastAPI 的推理服务（`inference_vllm_server.py`），使用
+[vLLM](https://github.com/vllm-project/vllm) 引擎来加速文本到语音的生成。
+由于 `vllm` 的预编译轮子与 CUDA / PyTorch 版本强相关，因此默认的
+`requirements.txt` 未直接包含该依赖，需要在环境就绪后手动安装。
+
+### 安装 vLLM
+
+请参考 [vLLM 安装指南](https://docs.vllm.ai/zh/latest/getting_started/installation.html)
+选择适合当前 CUDA 运行时的安装包。以 CUDA 12.1 环境为例，可执行：
+
+```bash
+pip install --upgrade pip
+pip install "vllm>=0.5.0" --extra-index-url https://download.pytorch.org/whl/cu121
+```
+
+> ⚠️ 具体的 `vllm` 版本号以及 `--extra-index-url` 参数需根据自身的 CUDA / PyTorch
+> 组合进行调整，安装前请确认环境兼容性。
+
+### 启动 vLLM 推理服务
+
+按照 [安装](#安装) 章节中的说明下载模型与 XY-Tokenizer 权重后，可通过以下命令启动：
+
+```bash
+python inference_vllm_server.py \
+  --model-path fnlp/MOSS-TTSD-v0.5 \
+  --spt-config XY_Tokenizer/config/xy_tokenizer_32k_config.yaml \
+  --spt-checkpoint XY_Tokenizer/weights/xy_tokenizer.ckpt \
+  --port 30001 \
+  --default-use-normalize \
+  --silence-duration 0.1
+```
+
+服务会监听 `/generate_audio` 接口并返回 WAV 格式的音频字节，可选地通过
+Base64 编码的 `prompt_audio*` 字段提供说话人参考音频。
+
+### 请求示例
+
+```bash
+curl -X POST "http://localhost:30001/generate_audio" \
+  -H "Content-Type: application/json" \
+  -o reply.wav \
+  -d '{
+        "text": "[S1]你好！[S2]很高兴见到你！",
+        "use_normalize": true
+      }'
+```
 
 ## 使用 SGLang 加速推理
 

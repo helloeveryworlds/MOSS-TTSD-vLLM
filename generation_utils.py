@@ -1,11 +1,33 @@
 import os
 import re
+from copy import deepcopy
+from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 import numpy as np
 import torch
 import torchaudio
 
 MAX_CHANNELS = 8
+PAD_TOKEN_ID = 1024
+
+
+def load_tokenizer_and_spt(
+    model_path: str,
+    spt_config_path: str,
+    spt_checkpoint_path: str,
+):
+    """Load tokenizer and speech tokenizer without instantiating the LLM."""
+
+    from transformers import AutoTokenizer
+
+    from XY_Tokenizer.xy_tokenizer.model import XY_Tokenizer
+
+    tokenizer = AutoTokenizer.from_pretrained(model_path)
+    spt = XY_Tokenizer.load_from_checkpoint(
+        config_path=spt_config_path, ckpt_path=spt_checkpoint_path
+    )
+    spt.eval()
+    return tokenizer, spt
 
 
 def load_model(
@@ -15,21 +37,18 @@ def load_model(
     torch_dtype=torch.bfloat16,
     attn_implementation="flash_attention_2",
 ):
-    from transformers import AutoTokenizer
-
     from modeling_asteroid import AsteroidTTSInstruct
-    from XY_Tokenizer.xy_tokenizer.model import XY_Tokenizer
 
-    tokenizer = AutoTokenizer.from_pretrained(model_path)
+    tokenizer, spt = load_tokenizer_and_spt(
+        model_path=model_path,
+        spt_config_path=spt_config_path,
+        spt_checkpoint_path=spt_checkpoint_path,
+    )
     model = AsteroidTTSInstruct.from_pretrained(
         model_path, torch_dtype=torch_dtype, attn_implementation=attn_implementation
     )
-    spt = XY_Tokenizer.load_from_checkpoint(
-        config_path=spt_config_path, ckpt_path=spt_checkpoint_path
-    )
 
     model.eval()
-    spt.eval()
     return tokenizer, model, spt
 
 
@@ -203,8 +222,8 @@ def process_inputs(
     device,
     silence_duration,
     audio_data=None,
-    max_channels=8,
-    pad_token=1024,
+    max_channels=MAX_CHANNELS,
+    pad_token=PAD_TOKEN_ID,
 ):
     seq = f"<|begin_of_style|>{prompt}<|end_of_style|>\n<|begin_of_text|>{text}<|end_of_text|>\n<|begin_of_speech|>"
     inputs1 = np.array(tokenizer.encode(seq))
@@ -240,7 +259,12 @@ def process_inputs(
     return input_ids
 
 
-def shifting_inputs(input_ids, tokenizer, pad_token=1024, max_channels=8):
+def shifting_inputs(
+    input_ids,
+    tokenizer,
+    pad_token: int = PAD_TOKEN_ID,
+    max_channels: int = MAX_CHANNELS,
+):
     seq_len = input_ids.shape[0]
     new_seq_len = seq_len + max_channels - 1
     shifted_input_ids = np.full((new_seq_len, max_channels), pad_token, dtype=np.int64)
@@ -252,14 +276,14 @@ def shifting_inputs(input_ids, tokenizer, pad_token=1024, max_channels=8):
     return shifted_input_ids
 
 
-def rpadding(input_ids, channels, tokenizer):
+def rpadding(input_ids, channels: int, tokenizer):
     attention_masks = [np.ones(inputs.shape[0]) for inputs in input_ids]
     max_length = max(ids.shape[0] for ids in input_ids)
     padded_input_ids, padded_attns = [], []
 
     for ids, attn in zip(input_ids, attention_masks):
         pad_len = max_length - ids.shape[0]
-        input_pad = np.full((pad_len, channels), 1024)
+        input_pad = np.full((pad_len, channels), PAD_TOKEN_ID)
         input_pad[:, 0] = tokenizer.pad_token_id
         padded_input_ids.append(np.concatenate([input_pad, ids]))
         attn_pad = np.zeros(pad_len)
@@ -271,7 +295,9 @@ def rpadding(input_ids, channels, tokenizer):
     return input_ids, attention_mask
 
 
-def find_max_valid_positions(C: torch.Tensor, invalid_value=1024) -> torch.Tensor:
+def find_max_valid_positions(
+    C: torch.Tensor, invalid_value: int = PAD_TOKEN_ID
+) -> torch.Tensor:
     values = C[:, :, 1]
     mask = values != invalid_value
     reversed_mask = mask.flip(dims=[1])
@@ -281,6 +307,170 @@ def find_max_valid_positions(C: torch.Tensor, invalid_value=1024) -> torch.Tenso
     has_valid = mask.any(dim=1)
     original_indices = torch.where(has_valid, original_indices, -1)
     return original_indices
+
+
+def find_max_valid_position_single(
+    sample: torch.Tensor, invalid_value: int = PAD_TOKEN_ID
+) -> int:
+    """Find the last valid speech token position for a single sample."""
+
+    values = sample[:, 1]
+    mask = values != invalid_value
+    if torch.any(mask):
+        return int(torch.nonzero(mask, as_tuple=False)[-1].item())
+    return -1
+
+
+def extract_speech_ids_from_shifted(
+    shifted_outputs: torch.Tensor,
+    max_channels: int = MAX_CHANNELS,
+) -> torch.Tensor:
+    """Recover speech tokens from shifted multi-channel outputs."""
+
+    if shifted_outputs.dim() == 2:
+        shifted_outputs = shifted_outputs.unsqueeze(0)
+
+    batch_size, seq_with_shift, _ = shifted_outputs.shape
+    seq_len = seq_with_shift - max_channels + 1
+    if seq_len <= 0:
+        raise ValueError(
+            "Shifted outputs length must be at least max_channels to extract speech tokens."
+        )
+
+    speech_ids = torch.zeros(
+        (batch_size, seq_len, max_channels),
+        dtype=shifted_outputs.dtype,
+        device=shifted_outputs.device,
+    )
+    for channel_idx in range(max_channels):
+        speech_ids[..., channel_idx] = shifted_outputs[
+            :, channel_idx : seq_len + channel_idx, channel_idx
+        ]
+    return speech_ids
+
+
+def _prepare_vllm_sampling_params(
+    sampling_params: Optional[Any],
+    max_new_tokens: Optional[int],
+    max_channels: int,
+):
+    try:
+        from vllm import SamplingParams
+    except ImportError as exc:  # pragma: no cover - optional dependency
+        raise ImportError(
+            "vLLM is required for vLLM-based inference. Install it with `pip install vllm`."
+        ) from exc
+
+    if sampling_params is None:
+        total_max_tokens = (
+            max_new_tokens * max_channels if max_new_tokens is not None else None
+        )
+        sampling_params = SamplingParams(
+            temperature=0.0,
+            top_p=None,
+            top_k=None,
+            max_tokens=total_max_tokens,
+        )
+    else:
+        sampling_params = deepcopy(sampling_params)
+        if max_new_tokens is not None:
+            sampling_params.max_tokens = max_new_tokens * max_channels
+
+    if getattr(sampling_params, "max_tokens", None) is not None:
+        sampling_params.max_tokens = (
+            (sampling_params.max_tokens + max_channels - 1) // max_channels
+        ) * max_channels
+
+    return sampling_params
+
+
+def generate_with_vllm(
+    engine: Any,
+    input_sequences: Sequence[np.ndarray],
+    sampling_params: Optional[Any] = None,
+    max_channels: int = MAX_CHANNELS,
+    pad_token: int = PAD_TOKEN_ID,
+    max_new_tokens: Optional[int] = None,
+):
+    """Generate speech tokens using a vLLM engine.
+
+    Args:
+        engine: vLLM LLM engine instance.
+        input_sequences: Sequence of shifted prompt tensors (numpy arrays).
+        sampling_params: Optional vLLM SamplingParams; copied before use.
+        max_channels: Number of speech channels.
+        pad_token: Token id used for padding speech channels.
+        max_new_tokens: Optional limit for newly generated multi-channel steps.
+
+    Returns:
+        A tuple `(speech_tokens, token_stats)` where `speech_tokens` is a list of
+        tensors containing decoded speech ids for each sample, and `token_stats`
+        contains prompt/completion token usage metadata.
+    """
+
+    if engine is None:
+        raise ValueError("vLLM engine must be provided when using vLLM inference.")
+
+    params = _prepare_vllm_sampling_params(
+        sampling_params=sampling_params,
+        max_new_tokens=max_new_tokens,
+        max_channels=max_channels,
+    )
+
+    prompts: List[List[int]] = []
+    prompt_lengths: List[int] = []
+    prompt_steps: List[int] = []
+    for arr in input_sequences:
+        prompt = arr.reshape(-1).tolist()
+        prompts.append(prompt)
+        prompt_lengths.append(len(prompt))
+        prompt_steps.append(arr.shape[0])
+
+    results = engine.generate(prompt_token_ids=prompts, sampling_params=params)
+
+    generated_speech: List[torch.Tensor] = []
+    token_stats: List[Dict[str, int]] = []
+
+    for prompt_len, prompt_step_len, arr_prompt, result in zip(
+        prompt_lengths, prompt_steps, input_sequences, results
+    ):
+        prompt_tokens = list(result.prompt_token_ids)
+        if len(prompt_tokens) != prompt_len:
+            raise ValueError(
+                "Mismatch between provided prompt length and vLLM acknowledged prompt length."
+            )
+
+        if not result.outputs:
+            raise RuntimeError("vLLM did not return any outputs for the request.")
+
+        completion_tokens = list(result.outputs[0].token_ids)
+        full_tokens = prompt_tokens + completion_tokens
+        pad_len = (-len(full_tokens)) % max_channels
+        if pad_len:
+            full_tokens.extend([pad_token] * pad_len)
+
+        full_tensor = torch.tensor(full_tokens, dtype=torch.long)
+        full_tensor = full_tensor.view(-1, max_channels)
+
+        start = prompt_step_len - max_channels + 1
+        if start < 0:
+            start = 0
+        shifted = full_tensor[start:]
+        speech_ids = extract_speech_ids_from_shifted(
+            shifted, max_channels=max_channels
+        )[0]
+        speech_ids[:, 0] = speech_ids[:, 0] - 151665
+
+        generated_speech.append(speech_ids)
+        token_stats.append(
+            {
+                "prompt_tokens": len(prompt_tokens),
+                "completion_tokens": len(completion_tokens),
+                "total_tokens": len(full_tokens),
+            }
+        )
+
+    return generated_speech, token_stats
 
 
 def normalize_text(text: str) -> str:
@@ -391,6 +581,9 @@ def process_batch(
     start_idx,
     use_normalize=False,
     silence_duration=0,
+    vllm_engine: Optional[Any] = None,
+    vllm_sampling_params: Optional[Any] = None,
+    max_new_tokens: Optional[int] = None,
 ):
     """Process a batch of data items and generate audio, return audio data and metadata"""
     try:
@@ -442,7 +635,7 @@ def process_batch(
             prompt_audios.append(processed_item["prompt_audio"])
 
         # Process inputs
-        input_ids_list = []
+        input_ids_list: List[np.ndarray] = []
         for i, (text, prompt, audio_path) in enumerate(
             zip(texts, prompts, prompt_audios)
         ):
@@ -454,40 +647,59 @@ def process_batch(
             inputs = shifting_inputs(inputs, tokenizer)
             input_ids_list.append(inputs)
 
-        # Pad batch inputs
-        input_ids, attention_mask = rpadding(input_ids_list, MAX_CHANNELS, tokenizer)
+        print("Starting batch audio generation...")
 
-        # Batch generation
-        print(f"Starting batch audio generation...")
-        start = input_ids.shape[1] - MAX_CHANNELS + 1
+        speech_samples: List[torch.Tensor]
+        token_stats: List[Optional[Dict[str, int]]]
 
-        # Move inputs to GPU
-        input_ids = input_ids.to(device)
-        attention_mask = attention_mask.to(device)
+        if vllm_engine is None:
+            if model is None:
+                raise ValueError(
+                    "Model instance must be provided when vLLM engine is not used."
+                )
 
-        # Generate model outputs
-        outputs = model.generate(
-            input_ids=input_ids,
-            attention_mask=attention_mask,
-        )
-        print(f"Original outputs shape: {outputs.shape}")
-        print(f"Start value: {start}")
-        print(f"Shape after slicing: {outputs[:, start:].shape}")
-        print(f"MAX_CHANNELS: {MAX_CHANNELS}")
-        print(f"Calculated seq_len: {outputs.shape[1] - MAX_CHANNELS + 1}")
-        # Process outputs
-        outputs = outputs[:, start:]
-        seq_len = outputs.shape[1] - MAX_CHANNELS + 1
-        speech_ids = torch.full((outputs.shape[0], seq_len, MAX_CHANNELS), 0).to(device)
+            # Pad batch inputs
+            input_ids, attention_mask = rpadding(
+                input_ids_list, MAX_CHANNELS, tokenizer
+            )
 
-        # Adjust output format
-        for j in range(MAX_CHANNELS):
-            speech_ids[..., j] = outputs[:, j : seq_len + j, j]
-            if j == 0:
-                speech_ids[..., j] = speech_ids[..., j] - 151665
+            start = input_ids.shape[1] - MAX_CHANNELS + 1
 
-        # Find valid positions for each sample
-        li = find_max_valid_positions(speech_ids)
+            # Move inputs to device
+            input_ids = input_ids.to(device)
+            attention_mask = attention_mask.to(device)
+
+            outputs = model.generate(
+                input_ids=input_ids,
+                attention_mask=attention_mask,
+            )
+            print(f"Original outputs shape: {outputs.shape}")
+            print(f"Start value: {start}")
+            print(f"Shape after slicing: {outputs[:, start:].shape}")
+            print(f"MAX_CHANNELS: {MAX_CHANNELS}")
+            print(f"Calculated seq_len: {outputs.shape[1] - MAX_CHANNELS + 1}")
+
+            shifted_outputs = outputs[:, start:]
+            speech_batch = extract_speech_ids_from_shifted(
+                shifted_outputs, max_channels=MAX_CHANNELS
+            )
+            speech_batch[..., 0] = speech_batch[..., 0] - 151665
+
+            speech_samples = [speech_batch[i].detach().cpu() for i in range(batch_size)]
+            token_stats = [None] * batch_size
+        else:
+            speech_samples, token_stats = generate_with_vllm(
+                engine=vllm_engine,
+                input_sequences=input_ids_list,
+                sampling_params=vllm_sampling_params,
+                max_channels=MAX_CHANNELS,
+                pad_token=PAD_TOKEN_ID,
+                max_new_tokens=max_new_tokens,
+            )
+            if len(speech_samples) != batch_size:
+                raise RuntimeError(
+                    "vLLM generation returned mismatched number of samples."
+                )
 
         # Store audio result data
         audio_results = []
@@ -495,14 +707,19 @@ def process_batch(
         # Process batch sample results individually
         for i in range(batch_size):
             try:
-                # Extract valid speech tokens
-                end_idx = li[i] + 1
-                if end_idx <= 0:
+                speech_tokens = speech_samples[i]
+                if not isinstance(speech_tokens, torch.Tensor):
+                    speech_tokens = torch.tensor(speech_tokens)
+
+                speech_tokens = speech_tokens.to(torch.long).cpu()
+
+                end_idx = find_max_valid_position_single(speech_tokens)
+                if end_idx < 0:
                     print(f"Sample {start_idx + i} has no valid speech tokens")
                     audio_results.append(None)
                     continue
 
-                this_speech_id = speech_ids[i, :end_idx]
+                this_speech_id = speech_tokens[: end_idx + 1]
                 print(
                     f"Speech token shape for sample {start_idx + i}: {this_speech_id.shape}"
                 )
@@ -521,13 +738,15 @@ def process_batch(
                         )  # Convert to 2D [1, samples]
 
                 # Save audio data instead of file path
-                audio_results.append(
-                    {
-                        "audio_data": audio_result,
-                        "sample_rate": spt.output_sample_rate,
-                        "index": start_idx + i,
-                    }
-                )
+                result_entry = {
+                    "audio_data": audio_result,
+                    "sample_rate": spt.output_sample_rate,
+                    "index": start_idx + i,
+                }
+                if token_stats and token_stats[i] is not None:
+                    result_entry["token_usage"] = token_stats[i]
+
+                audio_results.append(result_entry)
                 print(f"Audio generation completed: sample {start_idx + i}")
 
             except Exception as e:
@@ -538,7 +757,8 @@ def process_batch(
                 audio_results.append(None)
 
         # Clean up GPU memory
-        torch.cuda.empty_cache()
+        if torch.cuda.is_available() and device == "cuda":
+            torch.cuda.empty_cache()
 
         # Return text data and audio data
         return actual_texts_data, audio_results

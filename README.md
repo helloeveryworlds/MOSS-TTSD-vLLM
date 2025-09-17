@@ -54,6 +54,8 @@ To run MOSS-TTSD, you need to install the required dependencies. You can use pip
 conda create -n moss_ttsd python=3.10 -y && conda activate moss_ttsd
 pip install -r requirements.txt
 pip install flash-attn
+# Optional: install vLLM separately if you plan to run the vLLM inference server.
+# Refer to https://docs.vllm.ai/en/latest/getting_started/installation.html for CUDA-specific wheels.
 ```
 
 ### Download XY-Tokenizer
@@ -491,6 +493,59 @@ python finetune/finetune_workflow.py --config path/to/your/config.yaml
 #### Parameters
 
 - `-c`, `--config`: Path to the workflow configuration YAML file (default: `./finetune/finetune_config.yaml`)
+
+## Accelerate Inference with vLLM
+
+We provide a lightweight FastAPI service (`inference_vllm_server.py`) that runs the
+MOSS-TTSD model through the [vLLM](https://github.com/vllm-project/vllm) engine to
+speed up text-to-speech decoding. The `vllm` package is not included in the default
+`requirements.txt` because its pre-built wheels depend on your CUDA and PyTorch
+versions—install it separately once your environment is ready.
+
+### Install vLLM
+
+Consult the [vLLM installation guide](https://docs.vllm.ai/en/latest/getting_started/installation.html)
+to choose the correct wheel for your CUDA runtime. For example, on a CUDA 12.1
+system with PyTorch wheels from the official index you can run:
+
+```bash
+pip install --upgrade pip
+pip install "vllm>=0.5.0" --extra-index-url https://download.pytorch.org/whl/cu121
+```
+
+> ⚠️ The exact `vllm` version and `--extra-index-url` flag depend on the CUDA/PyTorch
+> combination in your environment. Please adjust the command accordingly.
+
+### Launch the vLLM inference server
+
+Download the model and XY-Tokenizer weights as described in the [Installation](#installation)
+section, then start the server:
+
+```bash
+python inference_vllm_server.py \
+  --model-path fnlp/MOSS-TTSD-v0.5 \
+  --spt-config XY_Tokenizer/config/xy_tokenizer_32k_config.yaml \
+  --spt-checkpoint XY_Tokenizer/weights/xy_tokenizer.ckpt \
+  --port 30001 \
+  --default-use-normalize \
+  --silence-duration 0.1
+```
+
+The server listens on `/generate_audio` and returns WAV audio bytes. You can
+include optional `prompt_audio*` fields encoded with Base64 to provide reference
+speakers.
+
+### Example request
+
+```bash
+curl -X POST "http://localhost:30001/generate_audio" \
+  -H "Content-Type: application/json" \
+  -o reply.wav \
+  -d '{
+        "text": "[S1]Hello there![S2]Hi, nice to meet you!",
+        "use_normalize": true
+      }'
+```
 
 ## Accelerate Inference with SGLang
 

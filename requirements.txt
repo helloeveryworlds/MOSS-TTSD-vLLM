@@ -16,4 +16,9 @@ einops
 huggingface_hub
 liger_kernel
 pydub
-# flash-attn    # Need to install separately
+fastapi
+uvicorn
+
+# Optional dependencies (install separately if needed)
+# vllm        # Required for the FastAPI vLLM inference server
+# flash-attn  # Need to install separately
