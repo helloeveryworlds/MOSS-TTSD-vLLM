@@ -18,5 +18,7 @@ liger_kernel
 pydub
 fastapi
 uvicorn
-vllm
-# flash-attn    # Need to install separately
+
+# Optional dependencies (install separately if needed)
+# vllm        # Required for the FastAPI vLLM inference server
+# flash-attn  # Need to install separately
